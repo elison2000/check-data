@@ -11,6 +11,7 @@
 #      --------    -----------     -----------------------------------------------------------------
 #      v2.0        2022-03-26      使用diff替换sqlite3
 #      v2.1        2022-06-15      支持不同库名对比
+#      v2.2        2022-07-11      增加count模式，核对总行数
 ####################################################################################################
 """
 
@@ -43,14 +44,16 @@ def get_args():
     parser.add_argument("-S", "--source", type=str, help="要核对的source实例IP和端口, 如: 10.0.0.201:27017")
     parser.add_argument("-T", "--target", type=str, help="要核对的target实例IP和端口, 如: 10.0.0.202:27017")
     parser.add_argument("-u", "--user", type=str, default='dba_ro', help="用户名")
-    parser.add_argument("-p", "--password", dest="password", default='abc123', type=str, help="密码")
-    parser.add_argument("-d", "--database", type=str, help="要核对的数据库")
+    parser.add_argument("-p", "--password", dest="password", default='abc123*', type=str, help="密码")
+    parser.add_argument("-d", "--database", type=str, help="要核对的数据库，如：orderdb或orderdb:new_orderdb(可以使用冒号分别指定源端和目标端db名)")
     parser.add_argument("-t", "--tables", type=str, help="要核对的表(不指定为全库核对，多个表使用英文逗号分隔)，如：users,orders")
     parser.add_argument("-w", "--where", type=str, help="核对的where条件，默认全表核对")
     parser.add_argument("-E", "--execlude-tables", type=str, help="排除不需要核对的表(多个表使用英文逗号分隔)，如：tmp_users,tmp_orders")
     parser.add_argument("-r", "--recheck-times", type=int, default=0, help="复核次数，默认：0（不开启复核）")
     parser.add_argument("-R", "--max-recheck-rows", type=int, default=100, help="最大复核行数，首核不一致行数超过该数值，不进行复核，默认：100")
     parser.add_argument("-P", "--parallel", dest="parallel", type=int, default=2, help="并行度（进行多表核对时生效），默认：2")
+    parser.add_argument("-m", "--mode", type=str, default='slow', choices=['slow', 'count'],
+                        help="核对模式：slow-核对明细，速度慢；count-核对总行数，速度快")
     parser.add_argument("-l", "--log", type=str, default='info', choices=['debug', 'info', 'warning'],
                         help="输出的日志等级：debug,info,warning")
 
@@ -239,6 +242,12 @@ class Mongo:
                 yield raw_data
             else:
                 break
+
+    def count(self, db_name, tb_name, filter={}):
+        "返回数据行数"
+        tb = self.conn[db_name][tb_name]
+        res = tb.count(filter)
+        return res
 
     def get_collection_names(self, db_name):
         "获取集合名"
@@ -477,7 +486,7 @@ def re_compare_data(obj):
                 logging.info("TABLE:[{}] filter:{} 复核通过".format(obj.name, filter, i + 1))
                 break
             else:
-                logging.info("TABLE:[{}] filter:{} 第{}次复核不通过".format(obj.name,filter ,i + 1))
+                logging.info("TABLE:[{}] filter:{} 第{}次复核不通过".format(obj.name, filter, i + 1))
                 time.sleep(1)
         if row_is_same is False:
             logging.info("TABLE:[{}] source_rows: {}".format(obj.name, source_rows))
@@ -490,7 +499,7 @@ def re_compare_data(obj):
 
 
 def check_table(table_name, is_parallel=False):
-    "主程序"
+    "检查表明细"
     global CONFIG
     ts = time.time()
     logging.info("开始核对 [{}]".format(table_name))
@@ -532,6 +541,38 @@ def check_table(table_name, is_parallel=False):
     logging.info("核对结束 [{}] ,耗时{}s".format(table_name, seconds))
 
 
+def check_table_count(table_name):
+    "检查表行数"
+    global CONFIG
+    ts = time.time()
+    logging.info("开始核对 [{}]".format(table_name))
+    try:
+        obj = Table(table_name)
+        obj.init()
+        source_conn = Mongo(**obj.source_conf)
+        obj.source_rowcnt = source_conn.count(obj.source_db, obj.name, filter=obj.where)
+        target_conn = Mongo(**obj.target_conf)
+        obj.target_rowcnt = target_conn.count(obj.target_db, obj.name, filter=obj.where)
+        obj.diff_rowcnt = obj.target_rowcnt - obj.source_rowcnt
+
+        # 打印核对结果
+        if obj.diff_rowcnt == 0:
+            logging.info(
+                "TABLE:[{}]  RESULT:[YES]  INFO:[ source:{}  target:{}  diff:{} ]".format(obj.name, obj.source_rowcnt,
+                                                                                          obj.target_rowcnt,
+                                                                                          obj.diff_rowcnt))
+        else:
+            logging.info(
+                "TABLE:[{}]  RESULT:[NO]  INFO:[ source:{}  target:{}  diff:{} ]".format(obj.name, obj.source_rowcnt,
+                                                                                         obj.target_rowcnt,
+                                                                                         obj.diff_rowcnt))
+
+    except Exception as e:
+        logging.error("TABLE:[{}]    RESULT:[NO]    INFO:[ {} ]".format(table_name, str(e)), exc_info=True)
+    seconds = int(time.time() - ts)
+    logging.info("核对结束 [{}] ,耗时{}s".format(table_name, seconds))
+
+
 # main
 if __name__ == "__main__":
 
@@ -554,7 +595,7 @@ if __name__ == "__main__":
     else:
         tables = get_tables()
 
-    if len(tables) > 1:
+    if len(tables) > 1 and CONFIG.mode != "count":
         # 创建进程池
         logging.info("创建进程池，并行度：{}".format(CONFIG.parallel))
         pool = Pool(processes=CONFIG.parallel)
@@ -564,4 +605,7 @@ if __name__ == "__main__":
         pool.join()
     else:
         for tb in tables:
-            check_table(tb)
+            if CONFIG.mode == "count":
+                check_table_count(tb)
+            else:
+                check_table(tb)
